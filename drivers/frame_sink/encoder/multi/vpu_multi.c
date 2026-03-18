@@ -122,6 +122,11 @@ struct vpu_clks {
 static struct vpu_clks s_vpu_clks;
 static struct platform_device *multienc_pdev;
 
+static unsigned int multienc_dbg_pool_prealloc = 1;
+module_param(multienc_dbg_pool_prealloc, int, 0664);
+MODULE_PARM_DESC(multienc_dbg_pool_prealloc,
+	"Preallocate and keep multienc video CMA pool after probe/open for debugging");
+
 static void set_log_level(const char *module, int level)
 {
 	print_level = level;
@@ -1012,10 +1017,12 @@ static s32 vpu_open(struct inode *inode, struct file *filp)
 {
 	bool first_open = false;
 	s32 r = 0;
+	u32 prev_open_count;
 
 	//enc_pr(LOG_DEBUG, "[+] %s, filp=%lu, %lu, f_count=%lld\n", __func__,
 			//(unsigned long)filp, ( ((unsigned long)filp)%8), filp->f_count.counter);
 	spin_lock(&s_vpu_lock);
+	prev_open_count = s_vpu_drv_context.open_count;
 	s_vpu_drv_context.open_count++;
 	if (s_vpu_drv_context.open_count == 1) {
 		first_open = true;
@@ -1027,14 +1034,30 @@ static s32 vpu_open(struct inode *inode, struct file *filp)
 	}*/
 	filp->private_data = (void *)(&s_vpu_drv_context);
 	spin_unlock(&s_vpu_lock);
-	if (first_open && !use_reserve) {
+	enc_pr(LOG_INFO,
+		"vpu_open enter first_open=%d prev_open_count=%u new_open_count=%d use_reserve=%d video_phys=0x%lx video_size=%u common_phys=0x%lx common_size=%u cfg_size=%uMB prealloc=%u\n",
+		first_open,
+		prev_open_count,
+		s_vpu_drv_context.open_count,
+		use_reserve,
+		s_video_memory.phys_addr,
+		s_video_memory.size,
+		s_common_memory.phys_addr,
+		s_common_memory.size,
+		cma_cfg_size / SZ_1M,
+		multienc_dbg_pool_prealloc);
+	if (first_open && !use_reserve && !s_video_memory.phys_addr) {
 #ifdef CONFIG_CMA
+		enc_pr(LOG_INFO,
+			"vpu_open alloc video pool request=%uMB total_codec_mm=%uMB\n",
+			cma_cfg_size / SZ_1M,
+			(u32)codec_mm_get_total_size() / SZ_1M);
 		s_video_memory.size = cma_cfg_size;
 		s_video_memory.phys_addr = (ulong)codec_mm_alloc_for_dma(VPU_DEV_NAME, cma_cfg_size >> PAGE_SHIFT, 0, 0);
 
 		if (s_video_memory.phys_addr) {
-			enc_pr(LOG_DEBUG, "allocating phys 0x%lx, ", s_video_memory.phys_addr);
-			enc_pr(LOG_DEBUG, "virt addr 0x%lx, size %dk\n", s_video_memory.base, s_video_memory.size >> 10);
+			enc_pr(LOG_INFO, "vpu_open allocated video pool phys=0x%lx virt=0x%lx size=%ukB\n",
+				s_video_memory.phys_addr, s_video_memory.base, s_video_memory.size >> 10);
 
 			if (vmem_init(&s_vmem, s_video_memory.phys_addr, s_video_memory.size) < 0) {
 				enc_pr(LOG_ERROR, "fail to init vmem system\n");
@@ -1046,7 +1069,12 @@ static s32 vpu_open(struct inode *inode, struct file *filp)
 				memset(&s_vmem, 0, sizeof(struct video_mm_t));
 			}
 		} else {
-			enc_pr(LOG_ERROR, "Failed to alloc dma buffer %s, phys:0x%lx\n", VPU_DEV_NAME, s_video_memory.phys_addr);
+			enc_pr(LOG_ERROR,
+				"Failed to alloc dma buffer %s request=%uMB total_codec_mm=%uMB phys=0x%lx\n",
+				VPU_DEV_NAME,
+				cma_cfg_size / SZ_1M,
+				(u32)codec_mm_get_total_size() / SZ_1M,
+				s_video_memory.phys_addr);
 
 			if (s_video_memory.phys_addr)
 				codec_mm_free_for_dma(VPU_DEV_NAME, (u32)s_video_memory.phys_addr);
@@ -1058,6 +1086,10 @@ static s32 vpu_open(struct inode *inode, struct file *filp)
 		enc_pr(LOG_ERROR, "No CMA and reserved memory for MultiEnc!!!\n");
 		r = -ENOMEM;
 #endif
+	} else if (first_open && s_video_memory.phys_addr) {
+		enc_pr(LOG_INFO,
+			"vpu_open reuse preallocated pool phys=0x%lx size=%u use_reserve=%d\n",
+			s_video_memory.phys_addr, s_video_memory.size, use_reserve);
 	} else if (!s_video_memory.phys_addr) {
 		enc_pr(LOG_ERROR, "MultiEnc memory is not malloced yet wait & retry!\n");
 		r = -EBUSY;
@@ -1084,6 +1116,10 @@ static s32 vpu_open(struct inode *inode, struct file *filp)
 	}
 
 	if (r != 0) {
+		enc_pr(LOG_ERROR,
+			"vpu_open failed ret=%d first_open=%d open_count=%d video_phys=0x%lx common_phys=0x%lx\n",
+			r, first_open, s_vpu_drv_context.open_count,
+			s_video_memory.phys_addr, s_common_memory.phys_addr);
 		spin_lock(&s_vpu_lock);
 		s_vpu_drv_context.open_count--;
 		spin_unlock(&s_vpu_lock);
@@ -2543,19 +2579,10 @@ static s32 vpu_release(struct inode *inode, struct file *filp)
 				s_common_memory.phys_addr = 0;
 			}
 			#endif
-			if (s_video_memory.phys_addr && !use_reserve) {
+			if (s_video_memory.phys_addr)
 				enc_pr(LOG_DEBUG,
-					"vpu_release, s_video_memory 0x%lx\n",
-					s_video_memory.phys_addr);
-				codec_mm_free_for_dma(
-					VPU_DEV_NAME,
-					(u32)s_video_memory.phys_addr);
-				vmem_exit(&s_vmem);
-				memset(&s_video_memory,
-					0, sizeof(struct vpudrv_buffer_t));
-				memset(&s_vmem,
-					0, sizeof(struct video_mm_t));
-			}
+					"vpu_release keep video pool phys=0x%lx size=%u use_reserve=%d\n",
+					s_video_memory.phys_addr, s_video_memory.size, use_reserve);
 			if ((s_vpu_irq >= 0)
 				&& (s_vpu_irq_requested == true)) {
 				free_irq(s_vpu_irq, &s_vpu_drv_context);
@@ -3056,9 +3083,6 @@ static s32 vpu_probe(struct platform_device *pdev)
 	np = pdev->dev.of_node;
 	err = of_property_read_u32(np, "config_mm_sz_mb", &cma_cfg_size);
 
-	cma_cfg_size = 100;
-	enc_pr(LOG_DEBUG, "reset cma_cfg_size to 100");
-
 	if (err) {
 		enc_pr(LOG_DEBUG, "failed to get config_mm_sz_mb node, use default\n");
 		cma_cfg_size = VPU_INIT_VIDEO_MEMORY_SIZE_IN_BYTE;
@@ -3067,12 +3091,22 @@ static s32 vpu_probe(struct platform_device *pdev)
 		cma_cfg_size = cma_cfg_size*SZ_1M;
 
 	enc_pr(LOG_INFO, "cma  cfg size  %d\n", cma_cfg_size);
+	enc_pr(LOG_INFO, "probe start: config_mm_sz_mb=%u use_reserve=%d total_codec_mm=%uMB prealloc=%u\n",
+		cma_cfg_size / SZ_1M,
+		use_reserve,
+		(u32)codec_mm_get_total_size() / SZ_1M,
+		multienc_dbg_pool_prealloc);
 	idx = of_reserved_mem_device_init(&pdev->dev);
 
 	if (idx != 0)
 		enc_pr(LOG_DEBUG, "MultiEnc reserved memory config fail.\n");
-	else if (s_video_memory.phys_addr)
+	else if (s_video_memory.phys_addr) {
 		use_reserve = true;
+		enc_pr(LOG_INFO,
+			"probe reserved memory present phys=0x%lx size=%uMB\n",
+			s_video_memory.phys_addr,
+			s_video_memory.size / SZ_1M);
+	}
 
 	if (use_reserve == false) {
 #ifndef CONFIG_CMA
@@ -3086,6 +3120,41 @@ static s32 vpu_probe(struct platform_device *pdev)
 			codec_mm_get_total_size();
 
 		enc_pr(LOG_DEBUG, "MultiEnc - cma memory pool size: %d MB\n", (u32)cma_pool_size / SZ_1M);
+
+		if (multienc_dbg_pool_prealloc) {
+			s_video_memory.size = cma_cfg_size;
+			s_video_memory.phys_addr =
+				(ulong)codec_mm_alloc_for_dma(VPU_DEV_NAME,
+				cma_cfg_size >> PAGE_SHIFT, 0, 0);
+			if (s_video_memory.phys_addr) {
+				enc_pr(LOG_INFO,
+					"MultiEnc prealloc video pool phys=0x%lx size=%uMB\n",
+					s_video_memory.phys_addr,
+					s_video_memory.size / SZ_1M);
+				if (vmem_init(&s_vmem,
+					s_video_memory.phys_addr,
+					s_video_memory.size) < 0) {
+					enc_pr(LOG_ERROR, "fail to init prealloc vmem system\n");
+					codec_mm_free_for_dma(VPU_DEV_NAME,
+						(u32)s_video_memory.phys_addr);
+					memset(&s_video_memory, 0,
+						sizeof(struct vpudrv_buffer_t));
+					memset(&s_vmem, 0,
+						sizeof(struct video_mm_t));
+					err = -ENOMEM;
+					goto ERROR_PROVE_DEVICE;
+				}
+			} else {
+				enc_pr(LOG_ERROR,
+					"MultiEnc failed to prealloc video pool size=%uMB total_codec_mm=%uMB\n",
+					cma_cfg_size / SZ_1M,
+					(u32)codec_mm_get_total_size() / SZ_1M);
+				err = -ENOMEM;
+				goto ERROR_PROVE_DEVICE;
+			}
+		} else {
+			enc_pr(LOG_INFO, "MultiEnc prealloc video pool disabled\n");
+		}
 #endif
 	}
 
@@ -3188,8 +3257,8 @@ static s32 vpu_probe(struct platform_device *pdev)
 		s_common_memory.phys_addr = (ulong)codec_mm_alloc_for_dma(VPU_DEV_NAME, s_common_memory.size >> PAGE_SHIFT, 0, 0);
 
 		if (s_common_memory.phys_addr) {
-			enc_pr(LOG_DEBUG, "allocating phys 0x%lx, ", s_common_memory.phys_addr);
-			enc_pr(LOG_DEBUG, "virt addr 0x%lx, size %dk\n", s_common_memory.base, s_common_memory.size >> 10);
+			enc_pr(LOG_INFO, "probe allocated common pool phys=0x%lx virt=0x%lx size=%ukB\n",
+				s_common_memory.phys_addr, s_common_memory.base, s_common_memory.size >> 10);
 
 			if (vmem_init(&s_common_vmem, s_common_memory.phys_addr, s_common_memory.size) < 0) {
 				enc_pr(LOG_ERROR, "fail to init vmem system\n");
@@ -3202,7 +3271,12 @@ static s32 vpu_probe(struct platform_device *pdev)
 				goto ERROR_PROVE_DEVICE;
 			}
 		} else {
-			enc_pr(LOG_ERROR, "Failed to alloc dma buffer %s, phys:0x%lx\n", VPU_DEV_NAME, s_common_memory.phys_addr);
+			enc_pr(LOG_ERROR,
+				"Failed to alloc common dma buffer %s request=%uMB total_codec_mm=%uMB phys=0x%lx\n",
+				VPU_DEV_NAME,
+				s_common_memory.size / SZ_1M,
+				(u32)codec_mm_get_total_size() / SZ_1M,
+				s_common_memory.phys_addr);
 
 			if (s_common_memory.phys_addr)
 				codec_mm_free_for_dma(VPU_DEV_NAME, (u32)s_common_memory.phys_addr);
@@ -3222,6 +3296,13 @@ static s32 vpu_probe(struct platform_device *pdev)
 	}
 
 	enc_pr(LOG_DEBUG, "to be allocate from CMA pool_size 0x%lx\n", cma_pool_size);
+	enc_pr(LOG_INFO,
+		"probe done: video_phys=0x%lx video_size=%uMB common_phys=0x%lx common_size=%uMB use_reserve=%d\n",
+		s_video_memory.phys_addr,
+		s_video_memory.size / SZ_1M,
+		s_common_memory.phys_addr,
+		s_common_memory.size / SZ_1M,
+		use_reserve);
 	multienc_pdev = pdev;
 	pm_runtime_enable(&multienc_pdev->dev);
 
