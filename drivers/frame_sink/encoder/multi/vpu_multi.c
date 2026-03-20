@@ -369,12 +369,11 @@ static void vpu_clk_disable(struct vpu_clks *clks)
 	clk_disable_unprepare(clks->dos_apb_clk);
 	clk_disable_unprepare(clks->dos_clk);
 	/* the power off */
-	/* the power on */
 	if (get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_T7) {
 		enc_pr(LOG_INFO, "powering off wave521 for t7\n");
-		vdec_poweron(VDEC_WAVE);
+		vdec_poweroff(VDEC_WAVE);
 		mdelay(5);
-		enc_pr(LOG_INFO, "wave power stauts after poweroff: %d\n", vdec_on(VDEC_WAVE));
+		enc_pr(LOG_INFO, "wave power status after poweroff: %d\n", vdec_on(VDEC_WAVE));
 	} else {
 		pm_runtime_put_sync(&multienc_pdev->dev);
 		mdelay(5);
@@ -441,7 +440,28 @@ static void cache_flush(u32 buf_start, u32 buf_size)
 
 s32 vpu_hw_reset(void)
 {
-	enc_pr(LOG_DEBUG, "request vpu reset from application\n");
+	u32 open_count;
+
+	enc_pr(LOG_INFO, "request vpu reset from application\n");
+
+	/* Only perform hw reset if this is the only user of the encoder.
+	 * Doing a hard reset while another instance is encoding would
+	 * corrupt its state. */
+	spin_lock(&s_vpu_lock);
+	open_count = s_vpu_drv_context.open_count;
+	spin_unlock(&s_vpu_lock);
+
+	if (open_count > 1) {
+		enc_pr(LOG_ERROR,
+			"vpu_hw_reset: skipping — %u instances still open\n",
+			open_count);
+		return 0;
+	}
+
+	hw_reset(true);
+	mdelay(5);
+	hw_reset(false);
+	enc_pr(LOG_INFO, "vpu hw reset complete\n");
 	return 0;
 }
 
@@ -2588,6 +2608,14 @@ static s32 vpu_release(struct inode *inode, struct file *filp)
 				free_irq(s_vpu_irq, &s_vpu_drv_context);
 				s_vpu_irq_requested = false;
 			}
+
+			/* hardware reset before power off to ensure
+			 * clean state — prevents hang on next open
+			 * after unclean shutdown (e.g. SIGKILL) */
+			enc_pr(LOG_INFO, "vpu_release: hw reset before power off\n");
+			hw_reset(true);
+			mdelay(5);
+			hw_reset(false);
 
 			/* disable vpu clks.*/
 			vpu_clk_disable(&s_vpu_clks);
