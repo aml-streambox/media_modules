@@ -2773,7 +2773,13 @@ static int vpu_dma_buffer_map(struct vpu_dma_cfg *cfg)
 	}
 
 	page = sg_page(sg->sgl);
-	cfg->paddr = PFN_PHYS(page_to_pfn(page));
+	/* Use the DMA-mapped bus address returned by dma_buf_map_attachment().
+	 * Reconstructing an address from the first page only works for simple
+	 * direct-mapped memory and can be wrong for imported/exported dma-bufs.
+	 */
+	cfg->paddr = sg_dma_address(sg->sgl);
+	if (!cfg->paddr)
+		cfg->paddr = PFN_PHYS(page_to_pfn(page));
 	cfg->dbuf = dbuf;
 	cfg->attach = d_att;
 	cfg->vaddr = vaddr;
